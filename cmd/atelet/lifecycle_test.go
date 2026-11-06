@@ -25,6 +25,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/agent-substrate/substrate/cmd/atelet/internal/ateletpath"
@@ -37,6 +38,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/resources"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"k8s.io/utils/clock"
 )
@@ -75,6 +77,12 @@ type fakeWorker struct {
 	// fidelities records the fidelity each checkpoint or restore arrived
 	// with, by RPC name.
 	fidelities map[string]ateworkerpb.SnapshotFidelity
+	// hostedActorUID, when set, makes GetWorkloadStats report that actor as
+	// hosted (OK). Empty means NOT_FOUND for every actor.
+	hostedActorUID string
+	// callCounts tracks how many times each worker RPC was invoked.
+	callCounts map[string]int
+	mu         sync.Mutex
 }
 
 func (f *fakeWorker) recordFidelity(rpc string, fidelity ateworkerpb.SnapshotFidelity) {
@@ -91,9 +99,35 @@ func (f *fakeWorker) recordActorDirs(rpc string, actorDirs *ateworkerpb.ActorDir
 	f.actorDirs[rpc] = actorDirs
 }
 
+func (f *fakeWorker) bump(rpc string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.callCounts == nil {
+		f.callCounts = map[string]int{}
+	}
+	f.callCounts[rpc]++
+}
+
+func (f *fakeWorker) calls(rpc string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.callCounts[rpc]
+}
+
 func (f *fakeWorker) RunWorkload(_ context.Context, req *ateworkerpb.RunWorkloadRequest) (*ateworkerpb.RunWorkloadResponse, error) {
+	f.bump("RunWorkload")
 	f.recordActorDirs("RunWorkload", req.GetActorDirs())
 	return &ateworkerpb.RunWorkloadResponse{}, nil
+}
+
+func (f *fakeWorker) GetWorkloadStats(_ context.Context, req *ateworkerpb.GetWorkloadStatsRequest) (*ateworkerpb.GetWorkloadStatsResponse, error) {
+	f.bump("GetWorkloadStats")
+	if f.hostedActorUID == "" || f.hostedActorUID != req.GetActorUid() {
+		return nil, status.Errorf(codes.NotFound, "worker is not executing actor %q", req.GetActorUid())
+	}
+	return &ateworkerpb.GetWorkloadStatsResponse{
+		Sample: &ateworkerpb.WorkloadStatsSample{ActorUid: req.GetActorUid()},
+	}, nil
 }
 
 func (f *fakeWorker) CheckpointWorkload(_ context.Context, req *ateworkerpb.CheckpointWorkloadRequest) (*ateworkerpb.CheckpointWorkloadResponse, error) {
@@ -1231,5 +1265,158 @@ func TestPromoteSnapshotRecordsUpload(t *testing.T) {
 
 	if got := a.promote(t, snap); !proto.Equal(got, st) {
 		t.Errorf("state after a retried promote = %v, want %v", got, st)
+	}
+}
+
+// TestRunSkipsResetWhenWorkerAlreadyHostsActor covers atelet restart: the
+// in-memory view is empty, but GetWorkloadStats says the worker still hosts
+// the actor, so Run must not call RunWorkload again.
+func TestRunSkipsResetWhenWorkerAlreadyHostsActor(t *testing.T) {
+	useTempNodeDirs(t)
+	ctx := t.Context()
+
+	const (
+		atespace     = "ate-demo"
+		actorName    = "counter"
+		actorUID     = "01234567-89ab-cdef-0123-456789abcdef"
+		workerPodUID = "5f1c0d2e-3a4b-4c5d-8e9f-0a1b2c3d4e5f"
+	)
+
+	worker := &fakeWorker{hostedActorUID: actorUID}
+	serveFakeWorker(t, worker)
+
+	host := imageVolumeTestRegistry(t)
+	image := host + "/actor:v1"
+	pinnedImage := pushTestImage(t, image, singleFileLayer(t, "bin/app", "app"))
+	runsc := []byte("runsc binary")
+	s := &Atelet{
+		workerDialer:      newWorkerDialer(1),
+		imageCache:        newImageVolumeStore(t),
+		anonGCSClient:     fakeObjectStorage{data: runsc},
+		systemInfoVolumes: newSystemInfoVolumeRefresher(nil, nil),
+		snapshots:         snapshottracker.New(t.Context(), clock.RealClock{}),
+	}
+	sandboxAssets := &ateletpb.SandboxAssets{
+		SandboxClass: "gvisor",
+		PauseImage:   pinnedImage,
+		Assets: map[string]*ateletpb.ArchAssets{
+			runtime.GOARCH: {Files: map[string]*ateletpb.AssetFile{
+				runscAssetName: {
+					Url:    "gs://test-bucket/runsc",
+					Sha256: fmt.Sprintf("%x", sha256.Sum256(runsc)),
+				},
+			}},
+		},
+	}
+	spec := &ateletpb.WorkloadSpec{
+		Containers: []*ateletpb.Container{{Name: "app", Image: pinnedImage, Command: []string{"/bin/app"}}},
+	}
+
+	marker := filepath.Join(ateletpath.ActorPath(actorUID), "must-survive")
+	if err := os.MkdirAll(filepath.Dir(marker), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(marker, []byte("live"), 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	if _, err := s.Run(ctx, &ateletpb.RunRequest{
+		Atespace:              atespace,
+		ActorName:             actorName,
+		ActorUid:              actorUID,
+		ActorTemplateAtespace: "default",
+		ActorTemplateName:     "counter",
+		WorkerPodUid:          workerPodUID,
+		SandboxAssets:         sandboxAssets,
+		Spec:                  spec,
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := worker.calls("RunWorkload"); got != 0 {
+		t.Fatalf("RunWorkload calls = %d, want 0 (hosted short-circuit)", got)
+	}
+	if got := worker.calls("GetWorkloadStats"); got != 1 {
+		t.Fatalf("GetWorkloadStats calls = %d, want 1", got)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("actor dir marker after hosted Run: %v (resetActorDirs must not run)", err)
+	}
+}
+
+// TestRestoreSkipsResetWhenWorkerAlreadyHostsActor is the Restore twin of
+// TestRunSkipsResetWhenWorkerAlreadyHostsActor.
+func TestRestoreSkipsResetWhenWorkerAlreadyHostsActor(t *testing.T) {
+	useTempNodeDirs(t)
+	ctx := t.Context()
+
+	const (
+		atespace     = "ate-demo"
+		actorName    = "counter"
+		actorUID     = "01234567-89ab-cdef-0123-456789abcdef"
+		workerPodUID = "5f1c0d2e-3a4b-4c5d-8e9f-0a1b2c3d4e5f"
+	)
+
+	worker := &fakeWorker{
+		hostedActorUID: actorUID,
+		snapshotFiles:  map[string]string{"checkpoint.img": "guest-memory"},
+	}
+	serveFakeWorker(t, worker)
+
+	host := imageVolumeTestRegistry(t)
+	image := host + "/actor:v1"
+	pinnedImage := pushTestImage(t, image, singleFileLayer(t, "bin/app", "app"))
+	runsc := []byte("runsc binary")
+	s := &Atelet{
+		workerDialer:      newWorkerDialer(1),
+		imageCache:        newImageVolumeStore(t),
+		anonGCSClient:     fakeObjectStorage{data: runsc},
+		systemInfoVolumes: newSystemInfoVolumeRefresher(nil, nil),
+		snapshots:         snapshottracker.New(t.Context(), clock.RealClock{}),
+	}
+	sandboxAssets := &ateletpb.SandboxAssets{
+		SandboxClass: "gvisor",
+		PauseImage:   pinnedImage,
+		Assets: map[string]*ateletpb.ArchAssets{
+			runtime.GOARCH: {Files: map[string]*ateletpb.AssetFile{
+				runscAssetName: {
+					Url:    "gs://test-bucket/runsc",
+					Sha256: fmt.Sprintf("%x", sha256.Sum256(runsc)),
+				},
+			}},
+		},
+	}
+	spec := &ateletpb.WorkloadSpec{
+		Containers: []*ateletpb.Container{{Name: "app", Image: pinnedImage, Command: []string{"/bin/app"}}},
+	}
+
+	marker := filepath.Join(ateletpath.ActorPath(actorUID), "must-survive")
+	if err := os.MkdirAll(filepath.Dir(marker), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(marker, []byte("live"), 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	if _, err := s.Restore(ctx, &ateletpb.RestoreRequest{
+		Atespace:              atespace,
+		ActorName:             actorName,
+		ActorUid:              actorUID,
+		ActorTemplateAtespace: "default",
+		ActorTemplateName:     "counter",
+		WorkerPodUid:          workerPodUID,
+		SandboxAssets:         sandboxAssets,
+		Spec:                  spec,
+		Snapshot:              lifecycleSnapshot(actorUID, "snap-1", 1, ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY),
+	}); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if got := worker.calls("RestoreWorkload"); got != 0 {
+		t.Fatalf("RestoreWorkload calls = %d, want 0", got)
+	}
+	if got := worker.calls("GetWorkloadStats"); got != 1 {
+		t.Fatalf("GetWorkloadStats calls = %d, want 1", got)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("actor dir marker after hosted Restore: %v", err)
 	}
 }

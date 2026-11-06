@@ -589,6 +589,20 @@ func (s *Atelet) Run(ctx context.Context, req *ateletpb.RunRequest) (resp *atele
 
 	actorUID := req.GetActorUid()
 	actorRef := resources.ActorRef{Atespace: req.GetAtespace(), Name: req.GetActorName()}
+	workerPodUID := req.GetWorkerPodUid()
+
+	// After an atelet restart the in-memory view is empty, but the worker may
+	// still host this actor. Asking before resetActorDirs avoids wiping it.
+	hosted, err := s.workerHostsActor(ctx, workerPodUID, actorUID)
+	if err != nil {
+		return nil, err
+	}
+	if hosted {
+		slog.InfoContext(ctx, "Run retry; worker already hosts actor; skipping reset",
+			slog.String("actor", actorRef.String()), slog.String("actorUID", actorUID),
+			slog.String("workerPodUID", workerPodUID))
+		return &ateletpb.RunResponse{}, nil
+	}
 
 	sandboxRec, err := recordFromRequest(req.GetSandboxAssets())
 	if err != nil {
@@ -1170,6 +1184,18 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 
 	actorUID := req.GetActorUid()
 	actorRef := resources.ActorRef{Atespace: req.GetAtespace(), Name: req.GetActorName()}
+	workerPodUID := req.GetWorkerPodUid()
+
+	hosted, err := s.workerHostsActor(ctx, workerPodUID, actorUID)
+	if err != nil {
+		return nil, err
+	}
+	if hosted {
+		slog.InfoContext(ctx, "Restore retry; worker already hosts actor; skipping reset",
+			slog.String("actor", actorRef.String()), slog.String("actorUID", actorUID),
+			slog.String("workerPodUID", workerPodUID))
+		return &ateletpb.RestoreResponse{}, nil
+	}
 
 	// The sandbox (binaries + pause image) that runs the restored workload
 	// comes from the request, resolved by the control plane from the
@@ -1663,6 +1689,33 @@ func (s *Atelet) prepareOCIBundles(
 
 // dialWorker opens (or reuses) the gRPC connection to the target worker
 // pod and returns a worker client.
+// workerHostsActor reports whether the worker pod already hosts actorUID.
+// Used before resetActorDirs on Run/Restore so an atelet restart does not wipe
+// a live sandbox. Relies on GetWorkloadStats: NOT_FOUND means not hosted;
+// OK or FailedPrecondition (booting / no sample yet) means hosted.
+func (s *Atelet) workerHostsActor(ctx context.Context, workerPodUID, actorUID string) (bool, error) {
+	if workerPodUID == "" || actorUID == "" || s.workerDialer == nil {
+		return false, nil
+	}
+	client, err := s.dialWorker(ctx, workerPodUID)
+	if err != nil {
+		return false, err
+	}
+	_, err = client.GetWorkloadStats(ctx, &ateworkerpb.GetWorkloadStatsRequest{ActorUid: actorUID})
+	if err == nil {
+		return true, nil
+	}
+	switch status.Code(err) {
+	case codes.NotFound:
+		return false, nil
+	case codes.FailedPrecondition:
+		// Worker accepted the actor but has no sample yet (boot/restore).
+		return true, nil
+	default:
+		return false, fmt.Errorf("while asking worker %s if it hosts actor %s: %w", workerPodUID, actorUID, err)
+	}
+}
+
 func (s *Atelet) dialWorker(ctx context.Context, workerPodUID string) (ateworkerpb.WorkerClient, error) {
 	conn, err := s.workerDialer.DialWorkerPod(ctx, workerPodUID)
 	if err != nil {
