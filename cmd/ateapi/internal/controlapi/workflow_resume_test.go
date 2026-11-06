@@ -759,6 +759,8 @@ func TestValidateAssignedWorker(t *testing.T) {
 		wantActorState ateapipb.ActorState
 		// wantCrashMessage is the crash recorded when the actor is crashed.
 		wantCrashMessage string
+		// wantRecovery is the ActorStatus.recovery_visibility after the call.
+		wantRecovery ateapipb.ActorRecoveryVisibility
 		// wantAssignment is the assignment expected on the stored worker
 		// afterwards; wantWorkerWrite false additionally asserts the worker
 		// version did not move (no write at all).
@@ -770,6 +772,7 @@ func TestValidateAssignedWorker(t *testing.T) {
 			wantCode:         codes.Aborted,
 			wantActorState:   ateapipb.ActorState_ACTOR_STATE_CRASHED,
 			wantCrashMessage: "resume failed: " + crashMessageWorkerGone,
+			wantRecovery:      ateapipb.ActorRecoveryVisibility_ACTOR_RECOVERY_VISIBILITY_UNRECOVERABLE,
 		},
 		{
 			name:             "crashes actor and leaves worker untouched when worker is draining",
@@ -779,15 +782,17 @@ func TestValidateAssignedWorker(t *testing.T) {
 			wantCode:         codes.Aborted,
 			wantActorState:   ateapipb.ActorState_ACTOR_STATE_CRASHED,
 			wantCrashMessage: "resume failed: " + crashMessageWorkerDraining,
+			wantRecovery:      ateapipb.ActorRecoveryVisibility_ACTOR_RECOVERY_VISIBILITY_UNRECOVERABLE,
 			wantAssignment:   ownAssignment,
 		},
 		{
-			name:           "leaves actor and worker untouched when worker is unavailable",
+			name:           "sets recovery pending when worker is unavailable",
 			workerStatus:   unavailableStatus,
 			sandboxClass:   "gvisor",
 			assignment:     ownAssignment,
 			wantCode:       codes.Unavailable,
 			wantActorState: ateapipb.ActorState_ACTOR_STATE_RESUMING,
+			wantRecovery:   ateapipb.ActorRecoveryVisibility_ACTOR_RECOVERY_VISIBILITY_PENDING,
 			wantAssignment: ownAssignment,
 		},
 		{
@@ -798,6 +803,7 @@ func TestValidateAssignedWorker(t *testing.T) {
 			wantCode:         codes.Aborted,
 			wantActorState:   ateapipb.ActorState_ACTOR_STATE_CRASHED,
 			wantCrashMessage: "resume failed: " + crashMessageWorkerReassigned,
+			wantRecovery:      ateapipb.ActorRecoveryVisibility_ACTOR_RECOVERY_VISIBILITY_UNRECOVERABLE,
 			wantAssignment:   otherAssignment,
 		},
 		{
@@ -808,6 +814,7 @@ func TestValidateAssignedWorker(t *testing.T) {
 			wantCode:         codes.Aborted,
 			wantActorState:   ateapipb.ActorState_ACTOR_STATE_CRASHED,
 			wantCrashMessage: "resume failed: " + crashMessageWorkerReassigned,
+			wantRecovery:      ateapipb.ActorRecoveryVisibility_ACTOR_RECOVERY_VISIBILITY_UNRECOVERABLE,
 			wantAssignment:   staleIncarnationAssignment,
 		},
 		{
@@ -818,6 +825,7 @@ func TestValidateAssignedWorker(t *testing.T) {
 			wantCode:         codes.Aborted,
 			wantActorState:   ateapipb.ActorState_ACTOR_STATE_CRASHED,
 			wantCrashMessage: "resume failed: " + crashMessageWorkerReassigned,
+			wantRecovery:      ateapipb.ActorRecoveryVisibility_ACTOR_RECOVERY_VISIBILITY_UNRECOVERABLE,
 			wantAssignment:   nil,
 		},
 		{
@@ -837,6 +845,7 @@ func TestValidateAssignedWorker(t *testing.T) {
 			wantCode:         codes.Aborted,
 			wantActorState:   ateapipb.ActorState_ACTOR_STATE_CRASHED,
 			wantCrashMessage: "resume failed: " + crashMessageWorkerIneligible,
+			wantRecovery:      ateapipb.ActorRecoveryVisibility_ACTOR_RECOVERY_VISIBILITY_UNRECOVERABLE,
 			wantAssignment:   nil,
 			wantWorkerWrite:  true,
 		},
@@ -900,6 +909,9 @@ func TestValidateAssignedWorker(t *testing.T) {
 			}
 			if msg := actor.GetStatus().GetCrash().GetMessage(); msg != tt.wantCrashMessage {
 				t.Errorf("crash message = %q, want %q", msg, tt.wantCrashMessage)
+			}
+			if got := actor.GetStatus().GetRecoveryVisibility(); got != tt.wantRecovery {
+				t.Errorf("recovery visibility = %v, want %v", got, tt.wantRecovery)
 			}
 
 			if tt.workerStatus == nil {

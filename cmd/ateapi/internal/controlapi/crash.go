@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"strings"
 
+	"github.com/agent-substrate/substrate/cmd/ateapi/internal/controlapi/recovery"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/internal/actorevent"
 	"github.com/agent-substrate/substrate/internal/apierror"
@@ -60,26 +61,27 @@ func ateletCrashMessage(rpc string, err error) string {
 // ateletErrorCrashesActor reports whether a failed call to atelet's rpc should
 // crash the actor.
 func ateletErrorCrashesActor(ctx context.Context, isTerminateRPC bool, err error) bool {
-	// atelet.Terminate runs while the actor is being reverted or deleted. Crashing
-	// would clear the worker assignment the retry needs to terminate a sandbox
-	// that may still be running and to detach its volumes.
-	if isTerminateRPC {
-		return false
-	}
-
 	// Workflow's own context ended: the caller went away or the actor lease
-	// was lost.
+	// was lost. Keep the assignment so a retry can finish the operation.
 	if ctx.Err() != nil {
 		return false
 	}
 
+	ateletClass := recovery.AteletDefinite
 	switch status.Code(err) {
-	// Usually transport errors or atelet retriable errors.
 	case codes.Unavailable, codes.Canceled, codes.DeadlineExceeded:
-		return false
-	default:
-		return true
+		// Transport / timeout: the sandbox may still be running.
+		ateletClass = recovery.AteletAmbiguous
 	}
+	out := recovery.Decide(recovery.Input{
+		AssignmentRequired: true,
+		HasAssignment:      true,
+		WorkerHealth:       recovery.WorkerActive,
+		HostsActor:         true,
+		AteletClass:        ateletClass,
+		TerminateRPC:       isTerminateRPC,
+	})
+	return out.Action == recovery.CrashAndRelease
 }
 
 // handleAteletError handles an error from the atelet call rpc made for opName.
@@ -93,6 +95,12 @@ func handleAteletError(ctx context.Context, st crashActorStore, actorRef resourc
 			return cerr
 		}
 		return fmt.Errorf("actor %s crashed: %w", actorRef, err)
+	}
+
+	// Ambiguous / terminate failures keep the assignment; surface RecoverableFailure
+	// so clients watching Actor status know a retry is the recovery path.
+	if perr := persistActorRecoveryVisibility(ctx, st, actorRef, nil, recovery.RecoverableFailure); perr != nil {
+		return perr
 	}
 
 	// The caller went away or its deadline passed: report that, not atelet's
@@ -153,6 +161,7 @@ func crashActor(ctx context.Context, st crashActorStore, actorRef resources.Acto
 		if !wasAlreadyCrashed {
 			toUpdate.Status.Crash = newActorCrash(opName, message)
 		}
+		setStatusRecoveryVisibility(toUpdate.Status, recovery.Unrecoverable)
 
 		// In-progress snapshot entries in Status.Snapshots are kept so a later
 		// DeleteActor or RevertActor can delete what they name: each is the only

@@ -22,6 +22,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/agent-substrate/substrate/cmd/ateapi/internal/controlapi/recovery"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/internal/apierror"
 	"github.com/agent-substrate/substrate/internal/ateattr"
@@ -266,6 +267,7 @@ func (w *ActorWorkflow) ensureRevertedFinalized(ctx context.Context, actorRef re
 		// can keep track of stale snapshots that need to be cleaned up.
 		pruneSnapshots(toUpdate.Status, nil)
 		toUpdate.Status.Crash = nil
+		setStatusRecoveryVisibility(toUpdate.Status, recovery.VisibilityNone)
 		return nil
 	})
 	if err != nil {

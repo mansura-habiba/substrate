@@ -22,6 +22,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/agent-substrate/substrate/cmd/ateapi/internal/controlapi/recovery"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/scheduling"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/internal/apierror"
@@ -363,6 +364,10 @@ func (w *ActorWorkflow) validateAssignedWorker(ctx context.Context, actorRef res
 	if assignment == nil {
 		slog.ErrorContext(ctx, "expected a worker assignment on a RESUMING actor, found none")
 
+		out := recovery.Decide(recovery.Input{AssignmentRequired: true, HasAssignment: false})
+		if out.Action != recovery.CrashAndRelease {
+			return nil, apierror.Internal("recovery.Decide(missing assignment)=%v, want CrashAndRelease", out.Action)
+		}
 		// Crash the actor if its worker assignment is missing. We should never be in this state.
 		if cerr := crashActor(ctx, w.store, actorRef, ateattr.OperationResume, crashMessageWorkerAssignmentMissing); cerr != nil {
 			return nil, cerr
@@ -374,6 +379,15 @@ func (w *ActorWorkflow) validateAssignedWorker(ctx context.Context, actorRef res
 	if err != nil {
 		// Crash the actor if it was assigned to a deleted pod.
 		if errors.Is(err, store.ErrNotFound) {
+			out := recovery.Decide(recovery.Input{
+				AssignmentRequired: true,
+				HasAssignment:      true,
+				WorkerHealth:       recovery.WorkerGone,
+				HostsActor:         true,
+			})
+			if out.Action != recovery.CrashAndRelease {
+				return nil, apierror.Internal("recovery.Decide(gone)=%v, want CrashAndRelease", out.Action)
+			}
 			if cerr := crashActor(ctx, w.store, actorRef, ateattr.OperationResume, crashMessageWorkerGone); cerr != nil {
 				return nil, cerr
 			}
@@ -382,6 +396,15 @@ func (w *ActorWorkflow) validateAssignedWorker(ctx context.Context, actorRef res
 		return nil, fmt.Errorf("failed to get already assigned worker for actor %w", err)
 	}
 	if worker.GetStatus().GetState() == ateapipb.WorkerState_WORKER_STATE_DRAINING {
+		out := recovery.Decide(recovery.Input{
+			AssignmentRequired: true,
+			HasAssignment:      true,
+			WorkerHealth:       recovery.WorkerDraining,
+			HostsActor:         true,
+		})
+		if out.Action != recovery.CrashAndRelease {
+			return nil, apierror.Internal("recovery.Decide(draining)=%v, want CrashAndRelease", out.Action)
+		}
 		slog.InfoContext(ctx, "Assigned worker is draining; crashing actor",
 			slog.String("actor", actorRef.String()),
 			slog.String("worker", worker.GetWorkerNamespace()+"/"+worker.GetWorkerPod()))
@@ -393,6 +416,18 @@ func (w *ActorWorkflow) validateAssignedWorker(ctx context.Context, actorRef res
 	// An unavailable worker may come back with its Actors intact. If its worker
 	// restarted instead, the raised epoch has this Actor crashed for it.
 	if worker.GetStatus().GetState() == ateapipb.WorkerState_WORKER_STATE_UNAVAILABLE {
+		out := recovery.Decide(recovery.Input{
+			AssignmentRequired: true,
+			HasAssignment:      true,
+			WorkerHealth:       recovery.WorkerUnavailable,
+			HostsActor:         true,
+		})
+		if out.Action != recovery.WaitSameAssignment || out.AllowReassign {
+			return nil, apierror.Internal("recovery.Decide(unavailable)=%v allowReassign=%v, want WaitSameAssignment", out.Action, out.AllowReassign)
+		}
+		if perr := persistActorRecoveryVisibility(ctx, w.store, actorRef, actor, out.ClientVisibility); perr != nil {
+			return nil, perr
+		}
 		return nil, apierror.Unavailable("worker %s assigned to actor %s is unavailable", worker.GetMetadata().GetName(), actorRef)
 	}
 	// Verify the worker is still hosting this Actor.
@@ -914,6 +949,7 @@ func (w *ActorWorkflow) finalizeRunning(ctx context.Context, actorRef resources.
 
 	storedActor, err := w.store.UpdateActor(ctx, actorRef, store.PreconditionFrom(latestActor), func(toUpdate *ateapipb.Actor) error {
 		toUpdate.Status.State = ateapipb.ActorState_ACTOR_STATE_RUNNING
+		setStatusRecoveryVisibility(toUpdate.Status, recovery.VisibilityNone)
 		return nil
 	})
 	if err != nil {

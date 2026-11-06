@@ -62,6 +62,20 @@ func actorTemplateDisplay(a *ateapipb.Actor) string {
 	return ref.GetAtespace() + "/" + ref.GetName()
 }
 
+// actorRecoveryDisplay is the RECOVERY column value for kubectl-ate get actor.
+func actorRecoveryDisplay(v ateapipb.ActorRecoveryVisibility) string {
+	switch v {
+	case ateapipb.ActorRecoveryVisibility_ACTOR_RECOVERY_VISIBILITY_PENDING:
+		return "pending"
+	case ateapipb.ActorRecoveryVisibility_ACTOR_RECOVERY_VISIBILITY_RECOVERABLE_FAILURE:
+		return "recoverable_failure"
+	case ateapipb.ActorRecoveryVisibility_ACTOR_RECOVERY_VISIBILITY_UNRECOVERABLE:
+		return "unrecoverable"
+	default:
+		return "<none>"
+	}
+}
+
 // PrintActorsTo prints a slice of actors to the provided writer.
 func PrintActorsTo(out io.Writer, actors []*ateapipb.Actor, format string) error {
 	sortActors(actors)
@@ -70,12 +84,13 @@ func PrintActorsTo(out io.Writer, actors []*ateapipb.Actor, format string) error
 		return printProto(out, &ateapipb.ListActorsResponse{Actors: actors}, format)
 	case "table":
 		w := tabwriter.NewWriter(out, 0, 0, 3, ' ', 0)
-		fmt.Fprintln(w, "ATESPACE\tNAME\tTEMPLATE\tSTATE\tWORKER POD\tWORKER IPS\tVERSION\tAGE")
+		fmt.Fprintln(w, "ATESPACE\tNAME\tTEMPLATE\tSTATE\tRECOVERY\tWORKER POD\tWORKER IPS\tVERSION\tAGE")
 		for _, actor := range actors {
 			atespace := actor.GetMetadata().GetAtespace()
 			name := actor.GetMetadata().GetName()
 			template := actorTemplateDisplay(actor)
 			state := actor.GetStatus().GetState().String()
+			recoveryCol := actorRecoveryDisplay(actor.GetStatus().GetRecoveryVisibility())
 
 			assignment := actor.GetStatus().GetWorkerAssignment()
 			worker := "<none>"
@@ -85,7 +100,7 @@ func PrintActorsTo(out io.Writer, actors []*ateapipb.Actor, format string) error
 
 			version := actor.GetMetadata().GetVersion()
 			age := formatAge(actor.GetMetadata().GetCreateTime())
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n", atespace, name, template, state, worker, strings.Join(assignment.GetWorkerPodIps(), ","), version, age)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n", atespace, name, template, state, recoveryCol, worker, strings.Join(assignment.GetWorkerPodIps(), ","), version, age)
 		}
 		return w.Flush()
 	default:

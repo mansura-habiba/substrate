@@ -45,7 +45,10 @@ for etcd.
 - **Actor**: a single instance derived from an `ActorTemplate`, identified by a
   DNS-1123 name. It is the unit that is suspended and resumed, and it moves
   between workers over its lifetime. An Actor record tracks its lifecycle
-  status and snapshot references.
+  status and snapshot references. `status.recovery_visibility` reports the
+  client-facing recovery signal (`pending`, `recoverable_failure`,
+  `unrecoverable`, or none) derived from control-plane recovery decisions;
+  `kubectl ate get actor` shows it in the `RECOVERY` column.
 
 - **Worker**: a record representing one worker pod in a `WorkerPool`. A Worker
   hosts several Actors at once, each in its own sandbox, up to its actor limit

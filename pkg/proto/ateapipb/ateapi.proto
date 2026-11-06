@@ -862,6 +862,22 @@ enum ActorState {
   // Keep this in sync with ActorStatus.state's maximum.
 }
 
+// ActorRecoveryVisibility is the client-facing recovery signal derived from
+// recovery.Decide's ClientVisibility. It is orthogonal to ActorState: an Actor
+// may be RESUMING with PENDING, or CRASHED with UNRECOVERABLE.
+enum ActorRecoveryVisibility {
+  ACTOR_RECOVERY_VISIBILITY_UNSPECIFIED = 0;
+  // NONE means no recovery-specific client signal (healthy / ordinary progress).
+  ACTOR_RECOVERY_VISIBILITY_NONE = 1;
+  // PENDING means the system is waiting on the same worker assignment.
+  ACTOR_RECOVERY_VISIBILITY_PENDING = 2;
+  // RECOVERABLE_FAILURE means the client may retry; actor state is still held.
+  ACTOR_RECOVERY_VISIBILITY_RECOVERABLE_FAILURE = 3;
+  // UNRECOVERABLE means the actor was crashed or cannot continue on this path.
+  ACTOR_RECOVERY_VISIBILITY_UNRECOVERABLE = 4;
+  // Keep this in sync with ActorStatus.recovery_visibility's maximum.
+}
+
 message ActorStatus {
   // state is the Actor's current lifecycle state.
   //
@@ -921,6 +937,17 @@ message ActorStatus {
   // +k8s:minimum=0
   // +k8s:update=NoUnset
   int32 last_assigned_generation = 12;
+
+  // recovery_visibility is how the control plane describes an in-flight
+  // recovery to clients. It mirrors recovery.ClientVisibility: PENDING while
+  // waiting on the same assignment, RECOVERABLE_FAILURE when the client may
+  // retry, UNRECOVERABLE after a crash/fence, and NONE when there is no
+  // recovery signal. Cleared to NONE when the Actor reaches RUNNING.
+  //
+  // +k8s:optional
+  // +k8s:minimum=1
+  // +k8s:maximum=4 # keep this in sync with the ActorRecoveryVisibility enum
+  ActorRecoveryVisibility recovery_visibility = 13;
 }
 
 // ActorCrash describes the failure that moved an Actor to CRASHED.
