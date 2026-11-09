@@ -118,6 +118,8 @@ type fakeWorker struct {
 	stoppedByResp *ateworkerpb.CheckpointWorkloadResponse
 	// terminations counts TerminateWorkload calls.
 	terminations atomic.Int32
+	// callCounts tracks how many times each worker RPC was invoked.
+	callCounts map[string]int
 }
 
 // setStoppedBy records the response of the checkpoint that stopped the
@@ -154,7 +156,17 @@ func (f *fakeWorker) recordActorDirs(rpc string, actorDirs *ateworkerpb.ActorDir
 	f.actorDirs[rpc] = actorDirs
 }
 
+func (f *fakeWorker) bump(rpc string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.callCounts == nil {
+		f.callCounts = map[string]int{}
+	}
+	f.callCounts[rpc]++
+}
+
 func (f *fakeWorker) RunWorkload(_ context.Context, req *ateworkerpb.RunWorkloadRequest) (*ateworkerpb.RunWorkloadResponse, error) {
+	f.bump("RunWorkload")
 	f.recordActorDirs("RunWorkload", req.GetActorDirs())
 	f.setStoppedBy(nil)
 	return &ateworkerpb.RunWorkloadResponse{WorkerEpoch: f.workerEpoch}, nil
@@ -196,6 +208,7 @@ func (f *fakeWorker) CheckpointWorkload(ctx context.Context, req *ateworkerpb.Ch
 }
 
 func (f *fakeWorker) RestoreWorkload(_ context.Context, req *ateworkerpb.RestoreWorkloadRequest) (*ateworkerpb.RestoreWorkloadResponse, error) {
+	f.bump("RestoreWorkload")
 	f.recordActorDirs("RestoreWorkload", req.GetActorDirs())
 	f.recordFidelity("RestoreWorkload", req.GetFidelity())
 	f.preserveRestoreDir = req.GetPreserveRestoreDir()
@@ -3617,6 +3630,10 @@ func TestRestoreStopsRetryingAfterConsecutiveUnavailableFailures(t *testing.T) {
 	if got := restoreCode(); got != codes.OK {
 		t.Fatalf("successful Restore code = %v, want %v", got, codes.OK)
 	}
+	// A successful Restore remembers the live identity so a lost-response
+	// retry short-circuits. Clear it so the Unavailable streak below still
+	// reaches the worker (as a fresh Restore after the workload is gone).
+	a.s.forgetLiveExecution(pluginActorUID)
 	failRetryably(maxConsecutiveRetryableRestoreFailures-1, "after a success")
 
 	// Restoring another snapshot starts a new streak.
@@ -3989,5 +4006,100 @@ func TestCheckpointKeepsWorkerUnavailable(t *testing.T) {
 	a.worker.checkpointErr = nil
 	if got := checkpointCode(); got != codes.OK {
 		t.Fatalf("Checkpoint with the worker back: code = %v, want %v", got, codes.OK)
+	}
+}
+
+// TestRunRestoreIdempotentSameActorPodUID proves that a second Run/Restore with
+// the same actor UID + worker pod UID (the #372 retry key after an ambiguous
+// timeout) returns success without calling the worker again.
+func TestRunRestoreIdempotentSameActorPodUID(t *testing.T) {
+	useTempNodeDirs(t)
+	ctx := t.Context()
+
+	const (
+		atespace     = "ate-demo"
+		actorName    = "counter"
+		actorUID     = "01234567-89ab-cdef-0123-456789abcdef"
+		workerPodUID = "5f1c0d2e-3a4b-4c5d-8e9f-0a1b2c3d4e5f"
+		snapshotName = "pause-snap-1"
+	)
+
+	worker := &fakeWorker{snapshotFiles: map[string]string{"checkpoint.img": "guest-memory"}}
+	serveFakeWorker(t, worker)
+
+	host := imageVolumeTestRegistry(t)
+	image := host + "/actor:v1"
+	pinnedImage := pushTestImage(t, image, singleFileLayer(t, "bin/app", "app"))
+
+	release := newGVisorTestRelease(t)
+	s := &Atelet{
+		workerDialer:      newWorkerDialer(1),
+		imageCache:        newImageVolumeStore(t),
+		sandboxAssetCache: newTestAssetCache(t),
+		anonGCSClient:     fakeObjectStorage{data: release.tarball},
+		systemInfoVolumes: newSystemInfoVolumeRefresher(nil, nil),
+		snapshots:         snapshottracker.New(t.Context(), nil, clock.RealClock{}),
+		checkpointTimeout: defaultCheckpointTimeout,
+	}
+	sandboxRec := testSandboxRecord(release)
+	spec := &ateletpb.WorkloadSpec{
+		Containers: []*ateletpb.Container{{Name: "app", Image: pinnedImage, Command: []string{"/bin/app"}}},
+	}
+
+	advertiseRuntime(t, s, sandboxRec)
+	runReq := &ateletpb.RunRequest{
+		Atespace:              atespace,
+		ActorName:             actorName,
+		ActorUid:              actorUID,
+		ActorTemplateAtespace: "default",
+		ActorTemplateName:     "counter",
+		WorkerPodUid:          workerPodUID,
+		SandboxRuntime:        runtimeFor(t, sandboxRec),
+		Spec:                  spec,
+	}
+	if _, err := s.Run(ctx, runReq); err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+	if _, err := s.Run(ctx, runReq); err != nil {
+		t.Fatalf("retry Run after ambiguous timeout: %v", err)
+	}
+	if got := worker.callCounts["RunWorkload"]; got != 1 {
+		t.Fatalf("RunWorkload calls = %d, want 1 (retry must not re-start the sandbox)", got)
+	}
+
+	snap := lifecycleSnapshot(actorUID, snapshotName, 1, ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY)
+	if _, err := s.Checkpoint(ctx, &ateletpb.CheckpointRequest{
+		Atespace:              atespace,
+		ActorName:             actorName,
+		ActorUid:              actorUID,
+		ActorTemplateAtespace: "default",
+		ActorTemplateName:     "counter",
+		WorkerPodUid:          workerPodUID,
+		Spec:                  spec,
+		Snapshot:              snap,
+		UploadConfig:          deferredUploadConfig(),
+	}); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+
+	restoreReq := &ateletpb.RestoreRequest{
+		Atespace:              atespace,
+		ActorName:             actorName,
+		ActorUid:              actorUID,
+		ActorTemplateAtespace: "default",
+		ActorTemplateName:     "counter",
+		WorkerPodUid:          workerPodUID,
+		SandboxRuntime:        runtimeFor(t, sandboxRec),
+		Spec:                  spec,
+		Snapshot:              snap,
+	}
+	if _, err := s.Restore(ctx, restoreReq); err != nil {
+		t.Fatalf("first Restore: %v", err)
+	}
+	if _, err := s.Restore(ctx, restoreReq); err != nil {
+		t.Fatalf("retry Restore after ambiguous timeout: %v", err)
+	}
+	if got := worker.callCounts["RestoreWorkload"]; got != 1 {
+		t.Fatalf("RestoreWorkload calls = %d, want 1", got)
 	}
 }
