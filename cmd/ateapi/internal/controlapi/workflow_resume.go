@@ -704,10 +704,10 @@ func checkVolumesAttachable(volumes []*ateapi.ExternalVolumeStatus) error {
 // ensureAteletRestored brings the workload up on the assigned worker:
 // restoring snapshotToResume, or cold-booting from the template spec when the
 // actor has no snapshot. This is the atelet reentrancy seam (#372): the
-// request is keyed by the actor UID and
-// the worker pod UID, so a re-entered workflow re-sends the same semantic
-// request; once atelet's Restore/Run are idempotent on those keys this step
-// becomes fully reentrant with no changes here.
+// request is keyed by the actor UID and the worker pod UID. Ambiguous atelet
+// failures keep this assignment (recovery.RetrySameExecution) so a workflow
+// retry re-sends the same semantic request; atelet's Restore/Run are
+// idempotent on those keys when the prior attempt already succeeded.
 func (w *ActorWorkflow) ensureAteletRestored(ctx context.Context, actorRef resources.ActorRef, actor *ateapi.Actor, actorTemplate *ateapi.ActorTemplate, volumePublishContexts map[string]map[string]string) (tele restoreTelemetry, workerEpoch int64, err error) {
 	ctx, done := stepSpan(ctx, "CallAteletRestore")
 	defer func() { err = done(err) }()
