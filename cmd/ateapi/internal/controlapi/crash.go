@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/cmd/ateapi/internal/controlapi/recovery"
 	"go.ate.dev/substrate/cmd/ateapi/internal/store"
 	"go.ate.dev/substrate/internal/actorevent"
 	"go.ate.dev/substrate/internal/apierror"
@@ -55,53 +56,58 @@ func ateletCrashMessage(rpc string, err error) string {
 	return fmt.Sprintf("atelet %s: %s", rpc, status.Convert(err).Message())
 }
 
-// ateletErrorCrashesActor reports whether a failed call to atelet's rpc should
-// crash the actor.
-func ateletErrorCrashesActor(ctx context.Context, isTerminateRPC bool, err error) bool {
-	// atelet.Terminate runs while the actor is being reverted or deleted. Crashing
-	// would clear the worker assignment the retry needs to terminate a sandbox
-	// that may still be running and to detach its volumes.
-	if isTerminateRPC {
-		return false
-	}
-
-	// Workflow's own context ended: the caller went away or the actor lease
-	// was lost.
+// ateletRecoveryOutcome classifies a failed atelet call for recovery.Decide.
+func ateletRecoveryOutcome(ctx context.Context, isTerminateRPC bool, err error) recovery.Outcome {
 	if ctx.Err() != nil {
-		return false
+		// Caller gone: keep the assignment so a later attempt can finish.
+		return recovery.Outcome{Action: recovery.RetrySameExecution, ClientVisibility: recovery.RecoverableFailure}
 	}
-
+	ateletClass := recovery.AteletDefinite
 	switch status.Code(err) {
-	// Usually transport errors or atelet retriable errors.
 	case codes.Unavailable, codes.Canceled, codes.DeadlineExceeded:
-		return false
-	default:
-		return true
+		ateletClass = recovery.AteletAmbiguous
 	}
+	return recovery.Decide(recovery.Input{
+		AssignmentRequired: true,
+		HasAssignment:      true,
+		WorkerHealth:       recovery.WorkerActive,
+		HostsActor:         true,
+		AteletClass:        ateletClass,
+		TerminateRPC:       isTerminateRPC,
+	})
 }
 
 // handleAteletError handles an error from the atelet call rpc made for opName.
-// It crashes the actor if ateletErrorCrashesActor says so, and otherwise
-// returns the error for the operation to be retried.
+// RetrySameExecution leaves the actor's worker assignment untouched so the
+// workflow retry rebuilds Run/Restore with the same WorkerPodUid + ActorUid
+// (#372 identity). CrashAndRelease fences the actor.
 func handleAteletError(ctx context.Context, st crashActorStore, actorRef resources.ActorRef, opName, rpc string, isTerminateRPC bool, err error) error {
-	if ateletErrorCrashesActor(ctx, isTerminateRPC, err) {
+	out := ateletRecoveryOutcome(ctx, isTerminateRPC, err)
+	switch out.Action {
+	case recovery.CrashAndRelease:
 		slog.LogAttrs(ctx, slog.LevelError, "Setting Actor to crashed due to Atelet error",
 			append(ateattr.ActorRefLogAttrs(actorRef), slog.Any("err", err))...)
 		if cerr := crashActor(ctx, st, actorRef, opName, ateletCrashMessage(rpc, err)); cerr != nil {
 			return cerr
 		}
 		return fmt.Errorf("actor %s crashed: %w", actorRef, err)
+	case recovery.RetrySameExecution:
+		// Do not clear or rewrite WorkerAssignment: ensureAteletRestored reads
+		// assignment.WorkerPodUid on the next attempt.
+		slog.LogAttrs(ctx, slog.LevelInfo, "Retrying atelet call against same execution identity",
+			append(ateattr.ActorRefLogAttrs(actorRef),
+				slog.String("rpc", rpc),
+				slog.String("recovery", "RetrySameExecution"))...)
+		if ctx.Err() != nil {
+			return fmt.Errorf("while calling atelet %s: %w: %w", rpc, err, ctx.Err())
+		}
+		if status.Code(err) == codes.Unavailable {
+			return apierror.Unavailable("while calling atelet %s (same execution): %w", rpc, err)
+		}
+		return apierror.Internal("while calling atelet %s (same execution): %w", rpc, err)
+	default:
+		return apierror.Internal("while calling atelet %s: unexpected recovery action %v: %w", rpc, out.Action, err)
 	}
-
-	// The caller went away or its deadline passed: report that, not atelet's
-	// error. The actor keeps its assignment, so a retry can finish the operation.
-	if ctx.Err() != nil {
-		return fmt.Errorf("while calling atelet %s: %w: %w", rpc, err, ctx.Err())
-	}
-	if status.Code(err) == codes.Unavailable {
-		return apierror.Unavailable("while calling atelet %s: %w", rpc, err)
-	}
-	return apierror.Internal("while calling atelet %s: %w", rpc, err)
 }
 
 // crashActorAndFail crashes the actor for a workflow step that found its

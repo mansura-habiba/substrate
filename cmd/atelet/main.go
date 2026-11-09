@@ -771,6 +771,14 @@ type Atelet struct {
 	bootID string
 	// checkpointTimeout is defaultCheckpointTimeout. Shortened in tests.
 	checkpointTimeout time.Duration
+
+	// liveExecutions remembers successful Run/Restore identities so a retry
+	// with the same actor UID + worker pod UID (lost-success-response) does
+	// not reset dirs or re-call the worker. At most one entry per actorUID.
+	// Cleared on Checkpoint, Terminate, failed readiness, cold-start Run/Restore,
+	// and when rememberLiveExecution finds a sandbox record already gone.
+	// Process restart clears the map. Keyed under mu.
+	liveExecutions map[string]string // actorUID -> workerPodUID
 }
 
 // defaultCheckpointTimeout bounds a Checkpoint once it detaches from the
@@ -832,6 +840,60 @@ func NewService(
 	return wms
 }
 
+func (s *Atelet) rememberLiveExecution(actorUID, workerPodUID string) {
+	if actorUID == "" || workerPodUID == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.liveExecutions == nil {
+		s.liveExecutions = map[string]string{}
+	}
+	s.liveExecutions[actorUID] = workerPodUID
+	uids := make([]string, 0, len(s.liveExecutions))
+	for uid := range s.liveExecutions {
+		uids = append(uids, uid)
+	}
+	s.mu.Unlock()
+	// Drop marks whose sandbox record is already gone (abandoned without
+	// Checkpoint/Terminate). Live actors keep their entry.
+	for _, uid := range uids {
+		if _, err := readSandboxRecord(uid); err != nil {
+			s.forgetLiveExecution(uid)
+		}
+	}
+}
+
+func (s *Atelet) forgetLiveExecution(actorUID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.liveExecutions, actorUID)
+}
+
+// liveExecutionReady is true when a prior Run/Restore for this identity is
+// still reflected on disk. Map membership, the sandbox-record read, and the
+// volumes-dir Lstat all run under the same write lock (Unlock only after
+// those checks), so a concurrent forget cannot race the readiness decision.
+// A broken volumes mount dir means this is not a lost-success retry: fall
+// through so ResetActorDirsKeepingVolumes can run (and report Canceled).
+func (s *Atelet) liveExecutionReady(actorUID, workerPodUID string) bool {
+	if actorUID == "" || workerPodUID == "" {
+		return false
+	}
+	s.mu.Lock()
+	ready := false
+	if s.liveExecutions != nil && s.liveExecutions[actorUID] == workerPodUID {
+		if _, err := readSandboxRecord(actorUID); err != nil {
+			delete(s.liveExecutions, actorUID)
+		} else if fi, err := os.Lstat(ateletpath.ExternalVolumeMountsDir(actorUID)); err != nil || !fi.IsDir() {
+			delete(s.liveExecutions, actorUID)
+		} else {
+			ready = true
+		}
+	}
+	s.mu.Unlock()
+	return ready
+}
+
 func (s *Atelet) Run(ctx context.Context, req *ateletpb.RunRequest) (resp *ateletpb.RunResponse, err error) {
 	if errs := apivalidation.ValidateRunRequest(ctx, req); len(errs) > 0 {
 		return nil, resources.ToAPIError(errs)
@@ -839,6 +901,17 @@ func (s *Atelet) Run(ctx context.Context, req *ateletpb.RunRequest) (resp *atele
 
 	actorUID := req.GetActorUid()
 	actorRef := resources.ActorRef{Atespace: req.GetAtespace(), Name: req.GetActorName()}
+	workerPodUID := req.GetWorkerPodUid()
+
+	// Same actor+pod identity already succeeded: treat as a retry of a lost
+	// success response (#372 / ambiguous timeout), not a cold start.
+	if s.liveExecutionReady(actorUID, workerPodUID) {
+		slog.InfoContext(ctx, "Run retry for live execution; skipping reset",
+			slog.String("actor", actorRef.String()), slog.String("actorUID", actorUID))
+		return &ateletpb.RunResponse{}, nil
+	}
+	// Cold start (or a different worker pod UID): drop any stale mark before reset.
+	s.forgetLiveExecution(actorUID)
 
 	// The sandbox binaries are the runtime the control plane assigned the
 	// actor to, resolved through the index. Resolved before any on-node work,
@@ -946,6 +1019,7 @@ func (s *Atelet) Run(ctx context.Context, req *ateletpb.RunRequest) (resp *atele
 		return nil, workerCallError("RunWorkload", err)
 	}
 
+	s.rememberLiveExecution(actorUID, workerPodUID)
 	return &ateletpb.RunResponse{WorkerEpoch: workerResp.GetWorkerEpoch()}, nil
 }
 
@@ -1127,6 +1201,9 @@ func (s *Atelet) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRequest
 		// the workload intact as retriable.
 		return nil, workerCallError("CheckpointWorkload", err)
 	}
+	// CheckpointWorkload has stopped the workload. Forget even if persist
+	// fails later, so a Restore cannot short-circuit on a stale live mark.
+	s.forgetLiveExecution(actorUID)
 	// The snapshot commits on this node once worker has written it, in either
 	// upload mode.
 	snap := snapshottracker.SnapshotRef{Snapshot: req.GetSnapshot(), CommitTime: time.Now(), Actor: actorRef}
@@ -1260,6 +1337,8 @@ func (s *Atelet) cleanUpAfterCheckpoint(ctx context.Context, req *ateletpb.Check
 			return fmt.Errorf("while removing actor files: %w", err)
 		}
 	}
+	// Workload is no longer running; a later Restore must not short-circuit.
+	s.forgetLiveExecution(actorUID)
 	return nil
 }
 
@@ -1626,6 +1705,15 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 	actorUID := req.GetActorUid()
 	actor := actorRef{atespace: req.GetAtespace(), name: req.GetActorName(), uid: actorUID}
 	actorRef := resources.ActorRef{Atespace: req.GetAtespace(), Name: req.GetActorName()}
+	workerPodUID := req.GetWorkerPodUid()
+
+	if s.liveExecutionReady(actorUID, workerPodUID) {
+		slog.InfoContext(ctx, "Restore retry for live execution; skipping reset",
+			slog.String("actor", actorRef.String()), slog.String("actorUID", actorUID))
+		return &ateletpb.RestoreResponse{}, nil
+	}
+	// Cold start (or a different worker pod UID): drop any stale mark before reset.
+	s.forgetLiveExecution(actorUID)
 
 	// The sandbox binaries that run the restored workload are the runtime the
 	// control plane assigned the actor to, resolved through the index. The
@@ -1892,6 +1980,7 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 		return nil, s.boundRetryableRestoreError(actorUID, req.GetSnapshot().GetSnapshotUuid(), workerRestoreError(ctx, err))
 	}
 
+	s.rememberLiveExecution(actorUID, workerPodUID)
 	return &ateletpb.RestoreResponse{WorkerEpoch: workerResp.GetWorkerEpoch()}, nil
 }
 
@@ -2058,6 +2147,7 @@ func (s *Atelet) Terminate(ctx context.Context, req *ateletpb.TerminateRequest) 
 
 	// Deregister after teardown succeeds
 	s.systemInfoVolumes.Deregister(actorUID)
+	s.forgetLiveExecution(actorUID)
 
 	// Unmount external volumes
 	if err := s.unmountExternalVolumes(ctx, actorUID, req.GetSpec().GetVolumes()); err != nil {
