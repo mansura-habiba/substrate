@@ -16,11 +16,20 @@ package child
 
 import (
 	"os/exec"
+	"runtime"
 	"testing"
 	"time"
 )
 
+func requireLinuxPidfd(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skipf("pidfd child reaping is Linux-only (GOOS=%s)", runtime.GOOS)
+	}
+}
+
 func TestReapedWhenItDiesOnItsOwn(t *testing.T) {
+	requireLinuxPidfd(t)
 	p, err := Start(exec.Command("sh", "-c", "kill -KILL $$"))
 	if err != nil {
 		t.Fatal(err)
@@ -39,6 +48,7 @@ func TestReapedWhenItDiesOnItsOwn(t *testing.T) {
 }
 
 func TestStop(t *testing.T) {
+	requireLinuxPidfd(t)
 	p, err := Start(exec.Command("sleep", "30"))
 	if err != nil {
 		t.Fatal(err)
