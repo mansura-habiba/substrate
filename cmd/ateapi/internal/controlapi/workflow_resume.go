@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/cmd/ateapi/internal/controlapi/recovery"
 	"go.ate.dev/substrate/cmd/ateapi/internal/scheduling"
 	"go.ate.dev/substrate/cmd/ateapi/internal/store"
 	"go.ate.dev/substrate/internal/apierror"
@@ -347,6 +348,15 @@ func (w *ActorWorkflow) validateAssignedWorker(ctx context.Context, actorRef res
 		return nil, fmt.Errorf("failed to get already assigned worker for actor %w", err)
 	}
 	if worker.GetStatus().GetState() == ateapi.WorkerState_WORKER_STATE_DRAINING {
+		out := recovery.Decide(recovery.Input{
+			AssignmentRequired: true,
+			HasAssignment:      true,
+			WorkerHealth:       recovery.WorkerDraining,
+			HostsActor:         true,
+		})
+		if out.Action != recovery.CrashAndRelease {
+			return nil, apierror.Internal("recovery.Decide(draining)=%v, want CrashAndRelease", out.Action)
+		}
 		slog.InfoContext(ctx, "Assigned worker is draining; crashing actor",
 			slog.String("actor", actorRef.String()),
 			slog.String("worker", worker.GetWorkerNamespace()+"/"+worker.GetWorkerPod()))
@@ -359,6 +369,15 @@ func (w *ActorWorkflow) validateAssignedWorker(ctx context.Context, actorRef res
 	// process restarted instead, a retried resume restores this Actor on the
 	// new process.
 	if worker.GetStatus().GetState() == ateapi.WorkerState_WORKER_STATE_UNAVAILABLE {
+		out := recovery.Decide(recovery.Input{
+			AssignmentRequired: true,
+			HasAssignment:      true,
+			WorkerHealth:       recovery.WorkerUnavailable,
+			HostsActor:         true,
+		})
+		if out.Action != recovery.WaitSameAssignment || out.AllowReassign {
+			return nil, apierror.Internal("recovery.Decide(unavailable)=%v allowReassign=%v, want WaitSameAssignment", out.Action, out.AllowReassign)
+		}
 		return nil, apierror.Unavailable("worker %s assigned to actor %s is unavailable", worker.GetMetadata().GetName(), actorRef)
 	}
 	if !scheduling.Registered(worker) {
