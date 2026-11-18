@@ -251,9 +251,11 @@ a run does not show up as a burst of failures.
 
 #### Sweperf Log Lines
 
-The boomer log also carries per-task facts for post-processing such as the goodput script in
-`tools/goodput`, which decides from them whether a task was good. The benchmark judges
-nothing. Durations are in milliseconds.
+The boomer log also carries per-task facts for post-processing, which run
+evaluations can read with the `cel` source's `json_lines` reader
+(`benchmarking/evaluate/README.md`), where a test entry's config decides
+whether a task was good. The benchmark judges nothing. Durations are in
+milliseconds.
 
 * `Completed sweperf cycle`: `actor`, `cycle`, `cel_ms` (0 when the execute failed),
   `wall_ms` (resume start to cycle end), `ok` (the execute succeeded, and so did the suspend
@@ -273,6 +275,8 @@ nothing. Durations are in milliseconds.
   the no-op resume got an asynchronous ack, so always for a one-cycle task), `retries`
   (failed resumes), `failed`, and the first failure's `fail_step` (`resume`, `execute` or
   `suspend`) and `fail_cycle`.
+* `SuspendActorAsync failed` (`SuspendActor failed` in the sync lifecycle mode): `actor` and
+  `err`. Like the other failure lines, it ties a task that never logged a record to its actor.
 * `sweperf on_start failed`: also carries `user`, to tie a failed start to its user.
 * `sweperf shutdown started`: the worker began tearing down. Startups and cycles in flight
   are canceled: interrupted tasks log no task record, and startup failures logged after it
@@ -429,12 +433,13 @@ turnover. Three things keep them apart:
   the `SuspendActor` and `SuspendActorAsync` rows hold only the turnover's
   parks.
 * The runner finds the end of the fill in boomer's log line
-  `agentsession: turnover fill done` and adds a `turnover_window` row to
-  `stats.jsonl` ([`locust/turnover_window.py`](../../benchmarking/locust/turnover_window.py)).
-  It holds each request's count (`requests_<name>`), failures
-  (`failures_<name>`) and rate (`rps_<name>`) from there to the end of the run
-  (`window_start`, `window_end`), read from `stats_history.csv`. Read the swap
-  rate from `rps_TimeToWake` against `--target-rps`.
+  `agentsession: turnover fill done` and adds a `turnover_<name>` row for
+  each request to `stats.jsonl` ([`locust/turnover_window.py`](../../benchmarking/locust/turnover_window.py)).
+  Each holds the request's `request_count`, `failure_count`, `requests_per_s`
+  and `failures_per_s` from there to the end of the run (`window_start`,
+  `window_end`), read from `stats_history.csv`. These are the keys of the
+  whole-run rows. Read the swap rate from the `requests_per_s` of
+  `turnover_TimeToWake` against `--target-rps`.
 * The server telemetry's steady-state window starts at the same point, so the
   memory, PSI and snapshot figures cover the turnover only.
 
@@ -621,8 +626,15 @@ see [automation/ateapi-cold-resume.md](../../benchmarking/automation/ateapi-cold
   `200:3m@1000`, changes it as the step starts. Keep the users at or above the
   rate times the p99 of one resume plus one suspend in seconds, or the step falls
   short of its rate.
+* `--burst-size`: Release cold resumes in waves of up to this many users at an
+  interval of `burst_size / target_rps` seconds instead of spacing them one by
+  one (default `0`, smooth pacing). Positive values require `--target-rps > 0`
+  on the command line and in every `--ladder` step. With `p99` as one resume
+  plus one suspend in seconds, keep the users at or above `burst_size` times
+  `floor(p99 / interval) + 1`, or `resume_rps` falls short of `target_rps`.
+  When users equal `burst_size`, this keeps `interval` above `p99`.
 
-The web UI shows the same field.
+The web UI shows the same fields.
 
 Trim the start of each ladder step. A rate change reaches boomer at its next
 poll of the master, within 10 s, and a step that adds users carries their
