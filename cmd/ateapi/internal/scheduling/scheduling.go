@@ -128,7 +128,14 @@ func (s *scheduler) Schedule(ctx context.Context, constraints Constraints) (*ate
 
 	var candidates []candidate
 	for _, worker := range workers {
-		if !s.Applies(worker, constraints) {
+		// Cheapest checks first. The runtime match parses the worker's
+		// cpu_features (#3924), and Booking parses them again, so a worker
+		// that fails on labels, node or actor slots never gets that far. A
+		// saturated fleet is all slot failures.
+		if !s.appliesBeforeRuntime(worker, constraints) || !hasActorSlot(worker) {
+			continue
+		}
+		if !constraints.RequiredRuntime.WorkerMatches(worker.GetStatus()) {
 			continue
 		}
 		booking, ok := Booking(worker, constraints)
@@ -233,6 +240,13 @@ func Registered(worker *ateapi.Worker) bool {
 }
 
 func (s *scheduler) Applies(worker *ateapi.Worker, constraints Constraints) bool {
+	return s.appliesBeforeRuntime(worker, constraints) && constraints.RequiredRuntime.WorkerMatches(worker.GetStatus())
+}
+
+// appliesBeforeRuntime is Applies without the runtime requirement, the one
+// check that parses worker attributes. Schedule runs it first, so the runtime
+// is matched only on workers that pass everything cheaper.
+func (s *scheduler) appliesBeforeRuntime(worker *ateapi.Worker, constraints Constraints) bool {
 	if !Registered(worker) {
 		return false
 	}
@@ -246,10 +260,6 @@ func (s *scheduler) Applies(worker *ateapi.Worker, constraints Constraints) bool
 	}
 
 	if len(constraints.RequiredNodes) > 0 && !slices.Contains(constraints.RequiredNodes, worker.GetNodeName()) {
-		return false
-	}
-
-	if !constraints.RequiredRuntime.WorkerMatches(worker.GetStatus()) {
 		return false
 	}
 
@@ -318,13 +328,20 @@ func sum(vs ...int64) (int64, bool) {
 	return total, true
 }
 
+// hasActorSlot reports whether worker has an actor slot left. Every
+// assignment takes one slot whatever its size, so a worker without one has
+// room for no actor.
+func hasActorSlot(worker *ateapi.Worker) bool {
+	return worker.GetStatus().GetAllocated().GetActors() < worker.GetStatus().GetCapacity().GetActors()
+}
+
 func checkRoom(worker *ateapi.Worker, want *ateapi.Resources) (candidate, bool) {
 	capacity := worker.GetStatus().GetCapacity()
 	used := worker.GetStatus().GetAllocated()
 
 	// No per-actor size to compare: every assignment costs one, so a worker at
 	// its limit has no room however small the next actor is.
-	if used.GetActors() >= capacity.GetActors() {
+	if !hasActorSlot(worker) {
 		return candidate{}, false
 	}
 
