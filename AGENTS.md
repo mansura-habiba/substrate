@@ -151,6 +151,15 @@ See the [metric registry](docs/guides/observability.md#the-metric-registry) sect
 4. For end-to-end tests involving the actual infrastructure, ensure you have a running cluster (on GKE, set up with `tools/setup-gcp` in [substrate-gke](https://github.com/ai-on-gke/substrate-gke)).
 5. A test that skips when a precondition is missing (Docker, a cluster, an artifact directory) must **fail** on it in CI, because a skip and a pass are the same exit code. Check for CI with a named predicate like `cmd/ateapi/internal/store/dockerenv.Required()` instead of an inline `os.Getenv("CI")`. Make sure the CI branch actually fails before merging. See `docs/dev/best-practices/ci-fail-closed.md`.
 
+## Actor recovery decisions
+
+Unavailable-worker and ambiguous-atelet recovery rules live in
+`cmd/ateapi/internal/controlapi/recovery`. Call `recovery.Decide` with explicit
+inputs instead of inventing a “retry on another worker” path. Atelet Run/Restore
+retries with the same actor UID + worker pod UID short-circuit when that
+execution is already live on the node (lost-success-response); Checkpoint and
+Terminate clear that live mark.
+
 ## Security Considerations
 
 Agent Substrate is built for zero-trust, multi-tenant execution of untrusted actors. Preserve and extend these invariants when modifying the codebase (see `docs/security/security.md` and `docs/security/threat-model.md` for the full architecture):
